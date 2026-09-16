@@ -2,8 +2,8 @@
 
 A small, transport-independent SQLite outbox at `energimetrics.helpers.outbox`.
 It protects outbound observations during external outages: **persist first,
-deliver second**. It never publishes messages, interprets payloads, or owns workers
-or retry policy.
+deliver second**. It never publishes messages, interprets payloads, or owns delivery workers
+or delivery retry policy.
 
 ## Usage
 
@@ -47,13 +47,13 @@ The caller schedules subsequent delivery attempts.
   returning. Strings are UTF-8 encoded; bytes remain exact, including non-UTF-8 data.
 - `pending(limit: int = 100) -> list[OutboxMessage]`: a bounded snapshot in ascending
   persistent ID order. Limit must be a positive signed 64-bit integer, not a bool.
-- `ack(message_id: int) -> None`: commits deletion. Repeating a positive ID is safe.
+- `ack(message_id: int) -> None`: commits a timezone-aware UTC delivery timestamp. Repeating a positive ID is safe.
 - `count() -> int`: current pending count.
 - `close() -> None`: closes resources; repeated calls are safe. Context managers
   close on both success and exceptions. Operations after close raise `OutboxError`.
 
 `OutboxMessage` is a frozen Pydantic model with `id`, `destination`, `payload`
-(bytes), and timezone-aware UTC `created_at`. Its timestamp is operational
+(bytes), timezone-aware UTC `created_at`, and nullable UTC `delivered_at`. Its timestamp is operational
 metadata recording entry into the outbox, not the observation time. The application
 creates the authoritative observation timestamp inside its payload; the outbox
 never parses or changes it. Ordering uses insertion IDs, even if the wall clock
@@ -100,7 +100,40 @@ outbox:
   path: /var/lib/energimetrics/outbox.db
 ```
 
-The helper does not manage Docker volumes or retain delivered message history.
+The helper does not manage Docker volumes. Acknowledged messages are retained
+as a temporary recovery journal. They no longer appear in `pending()` or `count()`;
+repeated acknowledgements preserve the original delivery timestamp.
+
+Retention is entirely internal to the helper and requires no application
+integration: applications continue to call only `enqueue()`, `pending()`, and
+`ack()`. No purge calls, cleanup scheduling, or delivered-row management are needed.
+`OutboxConfig.delivered_retention` defaults to 24 hours and `cleanup_interval`
+defaults to 1 hour. Both are positive `datetime.timedelta` values; Pydantic also
+accepts duration strings or seconds when loading configuration. For example:
+
+```yaml
+outbox:
+  path: /var/lib/energimetrics/outbox.db
+  delivered_retention: PT24H
+  cleanup_interval: PT1H
+```
+
+Cleanup runs on startup and then on an internal maintenance thread at the configured
+interval. It deletes only rows whose delivery timestamp is strictly older than
+the retention cutoff; pending messages are never expired. Delivered rows may remain
+until the next successful cleanup. Cleanup failures are logged and retried at the
+next interval without failing application operations. Cleanup uses a short SQLite
+lock timeout so contention does not hold up delivery or shutdown for the normal
+write timeout. Expired rows are deleted in batches of at most 100, releasing the
+connection lock and checking for shutdown between batches. Persistence failures still
+raise `OutboxError`. `close()` interrupts the maintenance wait and joins the worker.
+Startup cleanup completes synchronously, so a large expired backlog can delay
+construction. Batching limits rows per transaction, not elapsed time: large
+payloads or slow storage can still delay an individual batch and shutdown.
+SQLite reuses pages freed by deletion; retention does not necessarily shrink the
+database file or return disk space to the operating system.
+
+Existing databases are migrated automatically, preserving every pending message.
 Its schema is deliberately small:
 
 ```sql
@@ -108,8 +141,10 @@ CREATE TABLE outbox_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     destination TEXT NOT NULL,
     payload BLOB NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    delivered_at TEXT
 );
+CREATE INDEX outbox_messages_delivered_at ON outbox_messages (delivered_at);
 ```
 
 The caller controls acknowledgement. `ack()` means only that the caller considers
@@ -131,7 +166,7 @@ argument types/values raise `TypeError`/`ValueError`; invalid Pydantic models ra
 
 Share one `Outbox` across producer callbacks and one delivery worker within a
 process. A reentrant lock serializes all connection operations, complete
-transactions, and close. SQLite's cross-thread connection check is disabled only
+transactions, internal cleanup, and close. SQLite's cross-thread connection check is disabled only
 because this lock protects access. Delivery happens outside the lock.
 
 `pending()` does not claim or reserve messages. Multiple delivery workers could

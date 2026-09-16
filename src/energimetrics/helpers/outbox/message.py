@@ -4,7 +4,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validato
 
 
 class OutboxMessage(BaseModel):
-    """Immutable pending message; created_at is not the observation timestamp."""
+    """Immutable outbox message; created_at is not the observation timestamp."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -13,7 +13,9 @@ class OutboxMessage(BaseModel):
     payload: bytes = Field(strict=True)
     created_at: AwareDatetime
 
-    @field_validator("created_at")
+    delivered_at: AwareDatetime | None = None
+
+    @field_validator("created_at", "delivered_at")
     @classmethod
-    def normalize_utc(cls, value: datetime) -> datetime:
-        return value.astimezone(UTC)
+    def normalize_utc(cls, value: datetime | None) -> datetime | None:
+        return value.astimezone(UTC) if value is not None else None

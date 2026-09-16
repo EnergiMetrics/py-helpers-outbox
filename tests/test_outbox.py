@@ -3,7 +3,7 @@ import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from unittest.mock import patch
@@ -221,6 +221,7 @@ def test_invalid_input(config: OutboxConfig) -> None:
 
 
 def test_concurrent_producers_and_delivery(config: OutboxConfig) -> None:
+    config = config.model_copy(update={"cleanup_interval": timedelta(milliseconds=1)})
     done = Event()
     with Outbox(config) as box, ThreadPoolExecutor(max_workers=4) as pool:
 
