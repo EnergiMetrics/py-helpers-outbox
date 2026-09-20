@@ -3,6 +3,7 @@ name = "energimetrics.helpers.outbox"
 version = "0.1.0"
 description = "A durable transport-independent SQLite outbox for Energimetrics applications"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.14"
 dependencies = [
     "pydantic>=2.13.5",
