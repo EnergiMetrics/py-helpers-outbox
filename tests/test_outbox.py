@@ -54,7 +54,7 @@ def test_payload_and_committed_row(config: OutboxConfig, payload: bytes | str) -
     destination = "a/' ; DROP TABLE outbox_messages; --"
     before = datetime.now(UTC)
     with Outbox(config) as box:
-        message = box.enqueue(destination, payload)
+        message = box.enqueue([destination], payload)[0]
         assert isinstance(message, OutboxMessage)
         assert message.payload == (
             payload.encode() if isinstance(payload, str) else payload
@@ -76,8 +76,8 @@ def test_payload_and_committed_row(config: OutboxConfig, payload: bytes | str) -
 
 def test_restart_ack_and_ids(config: OutboxConfig) -> None:
     with Outbox(config) as box:
-        first = box.enqueue("example/one", b"first")
-        second = box.enqueue("example/two", b"second")
+        first = box.enqueue(["example/one"], b"first")[0]
+        second = box.enqueue(["example/two"], b"second")[0]
         assert box.count() == 2
     with Outbox(config) as box:
         assert box.pending() == [first, second]
@@ -86,7 +86,7 @@ def test_restart_ack_and_ids(config: OutboxConfig) -> None:
         assert box.count() == 1
         box.ack(second.id)
         assert box.count() == 0
-        third = box.enqueue("three", b"third")
+        third = box.enqueue(["three"], b"third")[0]
         assert third.id > second.id
         box.ack(first.id)
         assert box.pending() == [third]
@@ -98,7 +98,7 @@ def test_real_observation(config: OutboxConfig) -> None:
     payload = b'{"state":true,"timestamp":"2026-09-16T16:42:31.483Z"}'
     destination = "energimetrics/plantroom-pi-01/binaryinput/dhw_diverter"
     with Outbox(config) as box:
-        message = box.enqueue(destination, payload)
+        message = box.enqueue([destination], payload)[0]
     with Outbox(config) as box:
         assert box.pending() == [message]
         assert box.pending()[0].payload == payload
@@ -107,7 +107,7 @@ def test_real_observation(config: OutboxConfig) -> None:
 
 def test_order_and_limit(config: OutboxConfig) -> None:
     with Outbox(config) as box:
-        messages = [box.enqueue("test", str(i)) for i in range(105)]
+        messages = [box.enqueue(["test"], str(i))[0] for i in range(105)]
         # Simulate identical timestamps: ordering depends only on persistent IDs.
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
             db.execute(
@@ -137,13 +137,13 @@ def test_invalid_path(path: str) -> None:
 def test_close_and_context_exception(config: OutboxConfig) -> None:
     box = Outbox(config)
     with pytest.raises(RuntimeError), box:
-        box.enqueue("test", b"retained")
+        box.enqueue(["test"], b"retained")
         raise RuntimeError("caller failed")
     box.close()
     for operation in [
         box.count,
         box.pending,
-        lambda: box.enqueue("x", b"x"),
+        lambda: box.enqueue(["x"], b"x"),
         lambda: box.ack(1),
         box.__enter__,
     ]:
@@ -169,7 +169,7 @@ def test_write_failure(config: OutboxConfig) -> None:
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
             db.execute("PRAGMA query_only=ON")
         with pytest.raises(OutboxError) as error:
-            box.enqueue("test", b"must fail")
+            box.enqueue(["test"], b"must fail")
         assert isinstance(error.value.__cause__, sqlite3.Error)
         assert box.count() == 0
 
@@ -191,10 +191,10 @@ def test_commit_failure_rolls_back(config: OutboxConfig) -> None:
 
             db.set_authorizer(deny_commit)
         with pytest.raises(OutboxError):
-            box.enqueue("failed", b"no success")
+            box.enqueue(["failed"], b"no success")
         db.set_authorizer(None)
         assert box.count() == 0
-        message = box.enqueue("retry", b"ok")
+        message = box.enqueue(["retry"], b"ok")[0]
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
             db.set_authorizer(deny_commit)
         with pytest.raises(OutboxError):
@@ -214,9 +214,9 @@ def test_unsupported_durability(config: OutboxConfig) -> None:
 def test_invalid_input(config: OutboxConfig) -> None:
     with Outbox(config) as box:
         with pytest.raises(TypeError):
-            box.enqueue(5, b"x")  # pyright: ignore[reportArgumentType]
+            box.enqueue([5], b"x")  # pyright: ignore[reportArgumentType]
         with pytest.raises(TypeError):
-            box.enqueue("x", 5)  # pyright: ignore[reportArgumentType]
+            box.enqueue(["x"], 5)  # pyright: ignore[reportArgumentType]
         assert box.count() == 0
 
 
@@ -227,7 +227,7 @@ def test_concurrent_producers_and_delivery(config: OutboxConfig) -> None:
 
         def produce(producer: int) -> None:
             for number in range(30):
-                box.enqueue(str(producer), str(number))
+                box.enqueue([str(producer)], str(number))
 
         def deliver() -> list[OutboxMessage]:
             delivered: list[OutboxMessage] = []
@@ -260,8 +260,8 @@ def test_abrupt_process_exit(config: OutboxConfig) -> None:
 import os, sys
 from energimetrics.helpers.outbox import Outbox, OutboxConfig
 box = Outbox(OutboxConfig(path=sys.argv[1]))
-box.enqueue('one', b'first')
-box.enqueue('two', b'second')
+box.enqueue(['one'], b'first')
+box.enqueue(['two'], b'second')
 os._exit(0)
 """
     result = subprocess.run(

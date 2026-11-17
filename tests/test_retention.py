@@ -50,7 +50,7 @@ def test_invalid_duration(tmp_path: Path, field: str, value: int) -> None:
 def test_ack_retains_original_timestamp_and_pending_order(tmp_path: Path) -> None:
     config = OutboxConfig(path=tmp_path / "outbox.db")
     with Outbox(config) as box:
-        messages = [box.enqueue("test", str(i)) for i in range(3)]
+        messages = [box.enqueue(["test"], str(i))[0] for i in range(3)]
         before = datetime.now(UTC)
         box.ack(messages[1].id)
         delivered = rows(config)[1]
@@ -74,7 +74,7 @@ def test_startup_cleanup_and_retention_boundary(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     cutoff = now - config.delivered_retention
     with Outbox(config) as box:
-        messages = [box.enqueue("test", str(i)) for i in range(4)]
+        messages = [box.enqueue(["test"], str(i))[0] for i in range(4)]
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
             db.execute(
                 "UPDATE outbox_messages SET created_at = ?",
@@ -103,8 +103,8 @@ def test_background_cleanup_and_prompt_concurrent_close(tmp_path: Path) -> None:
     )
     box = Outbox(config)
     try:
-        pending = box.enqueue("pending", b"keep")
-        delivered = box.enqueue("delivered", b"expire")
+        pending = box.enqueue(["pending"], b"keep")[0]
+        delivered = box.enqueue(["delivered"], b"expire")[0]
         box.ack(delivered.id)
         assert len(rows(config)) == 2
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
@@ -138,7 +138,7 @@ def test_cleanup_failure_retries_without_breaking_operations(
         cleanup_interval=timedelta(milliseconds=20),
     )
     with Outbox(config) as box:
-        message = box.enqueue("test", b"payload")
+        message = box.enqueue(["test"], b"payload")[0]
         box.ack(message.id)
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
             db.execute(
@@ -154,7 +154,7 @@ def test_cleanup_failure_retries_without_breaking_operations(
         db.commit()
         with Outbox(config) as box:
             assert "Outbox retention cleanup failed" in caplog.text
-            message = box.enqueue("still working", b"ok")
+            message = box.enqueue(["still working"], b"ok")[0]
             assert box.pending() == [message]
             box.ack(message.id)
             assert box.count() == 0
@@ -200,7 +200,7 @@ def test_legacy_schema_migration(tmp_path: Path) -> None:
         assert message.payload == b"unchanged"
         assert message.delivered_at is None
         box.ack(42)
-        assert box.enqueue("new", b"new").id > 42
+        assert box.enqueue(["new"], b"new")[0].id > 42
     with Outbox(config) as box:
         assert box.count() == 1
         assert rows(config)[0].delivered_at is not None
@@ -221,7 +221,7 @@ def test_maintenance_contention_is_brief(tmp_path: Path, operation: str) -> None
             entered.set()
 
     try:
-        message = box.enqueue("pending", b"keep")
+        message = box.enqueue(["pending"], b"keep")[0]
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
             # Verify restoration of the actual setting, rather than a default.
             db.execute("PRAGMA busy_timeout=4321")
@@ -260,7 +260,7 @@ def test_retention_queries_use_index(tmp_path: Path) -> None:
                 "(destination, payload, created_at, delivered_at) VALUES (?, ?, ?, ?)",
                 [("history", b"payload", timestamp, timestamp)] * 1000,
             )
-        messages = [box.enqueue("pending", str(i)) for i in range(3)]
+        messages = [box.enqueue(["pending"], str(i))[0] for i in range(3)]
         statements: list[str] = []
         with box._operation() as db:  # pyright: ignore[reportPrivateUsage]
             db.set_trace_callback(statements.append)
@@ -320,7 +320,7 @@ def test_cleanup_batches_release_lock_and_honor_close(
                 assert batch_finished.wait(2)
                 # The first batch committed, and application operations can proceed.
                 assert len(rows(config)) == 150
-                message = box.enqueue("pending", b"keep")
+                message = box.enqueue(["pending"], b"keep")[0]
                 assert box.pending() == [message]
                 if stop_early:
                     box.close()
@@ -370,8 +370,8 @@ def test_retention_before_datetime_min_keeps_messages(
         path=tmp_path / "outbox.db", delivered_retention=timedelta.max
     )
     with Outbox(config) as box:
-        pending = box.enqueue("pending", b"keep")
-        delivered = box.enqueue("delivered", b"keep too")
+        pending = box.enqueue(["pending"], b"keep")[0]
+        delivered = box.enqueue(["delivered"], b"keep too")[0]
         box.ack(delivered.id)
     with Outbox(config) as box:
         box._cleanup()  # pyright: ignore[reportPrivateUsage]

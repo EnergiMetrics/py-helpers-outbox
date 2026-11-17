@@ -71,6 +71,10 @@ class Outbox:
                     "CREATE INDEX IF NOT EXISTS outbox_messages_delivered_at "
                     "ON outbox_messages (delivered_at)"
                 )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS outbox_messages_pending_destination "
+                    "ON outbox_messages (destination, id) WHERE delivered_at IS NULL"
+                )
         except (OSError, sqlite3.Error, OutboxError) as exc:
             if connection is not None:
                 connection.close()
@@ -146,34 +150,70 @@ class Outbox:
             except (sqlite3.Error, ValidationError) as exc:
                 raise OutboxError("Outbox database operation failed") from exc
 
-    def enqueue(self, destination: str, payload: bytes | str) -> OutboxMessage:
-        """Return only after commit. A failure may have an uncertain outcome."""
-        # Validate callers from untyped application code as well.
-        if not isinstance(destination, str):  # pyright: ignore[reportUnnecessaryIsInstance]
-            raise TypeError("destination must be str")
+    def enqueue(
+        self, destinations: list[str], payload: bytes | str
+    ) -> list[OutboxMessage]:
+        """Atomically queue one message per destination; return only after commit.
+
+        A failure may have an uncertain commit outcome, so retries can duplicate.
+        """
+        destinations = self._validate_destinations(destinations)
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
         elif not isinstance(payload, bytes):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError("payload must be bytes or str")
+        messages: list[OutboxMessage] = []
+        created_at = datetime.now(UTC).isoformat()
         with self._operation() as connection:
-            row = connection.execute(
-                "INSERT INTO outbox_messages (destination, payload, created_at) "
-                "VALUES (?, ?, ?) RETURNING id, destination, payload, created_at",
-                (destination, payload, datetime.now(UTC).isoformat()),
-            ).fetchall()[0]
-            message = OutboxMessage.model_validate(dict(row))
-        return message
+            for destination in destinations:
+                row = connection.execute(
+                    "INSERT INTO outbox_messages (destination, payload, created_at) "
+                    "VALUES (?, ?, ?) RETURNING id, destination, payload, created_at",
+                    (destination, payload, created_at),
+                ).fetchall()[0]
+                messages.append(OutboxMessage.model_validate(dict(row)))
+        return messages
 
-    def pending(self, limit: int = 100) -> list[OutboxMessage]:
-        """Read an oldest-first snapshot, without reserving messages for delivery."""
+    def pending(
+        self, limit: int = 100, *, destinations: list[str] | None = None
+    ) -> list[OutboxMessage]:
+        """Read an oldest-first snapshot, filtering before the combined limit.
+
+        None selects all destinations. Messages are not reserved for delivery.
+        """
         self._validate_integer(limit, "limit")
+        query = (
+            "SELECT id, destination, payload, created_at "
+            "FROM outbox_messages WHERE delivered_at IS NULL"
+        )
+        parameters: list[str | int] = []
+        if destinations is not None:
+            destinations = self._validate_destinations(destinations)
+            placeholders = ", ".join("?" for _ in destinations)
+            query += f" AND destination IN ({placeholders})"
+            parameters.extend(destinations)
+        query += " ORDER BY id LIMIT ?"
+        parameters.append(limit)
         with self._operation() as connection:
-            rows = connection.execute(
-                "SELECT id, destination, payload, created_at "
-                "FROM outbox_messages WHERE delivered_at IS NULL ORDER BY id LIMIT ?",
-                (limit,),
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
             return [OutboxMessage.model_validate(dict(row)) for row in rows]
+
+    @staticmethod
+    def _validate_destinations(destinations: list[str]) -> list[str]:
+        # Snapshot caller-owned input before validation and database operations.
+        if not isinstance(destinations, list):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError("destinations must be a list of strings")
+        snapshot = destinations.copy()
+        if not snapshot:
+            raise ValueError("destinations must not be empty")
+        for destination in snapshot:
+            if not isinstance(destination, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+                raise TypeError("each destination must be str")
+            if not destination.strip():
+                raise ValueError("destination names must not be empty or whitespace")
+        if len(set(snapshot)) != len(snapshot):
+            raise ValueError("destinations must not contain duplicates")
+        return snapshot
 
     def ack(self, message_id: int) -> None:
         """Record confirmed delivery once; repeated or absent IDs are safe."""
